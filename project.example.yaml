@@ -1,0 +1,44 @@
+# auto-strat-eval project configuration
+#
+# Copy this to your project directory and customize.
+# Point it at your dataset, metric, and backend.
+
+# Path to the declarative goal file
+goal: goal.md
+
+# Dataset configuration
+dataset:
+  # Directory containing label JSON files
+  labels_dir: /path/to/your/dataset/labels
+  # Base directory for resolving image paths in label files
+  image_root: /path/to/your/images
+  # Key in each label JSON that contains the image filename
+  image_key: image
+  # Key in each label JSON that contains the ground truth data
+  ground_truth_key: dishes
+
+# Evaluation backend
+backend:
+  # "chrome" (Chrome Built-in AI) or "adb" (Android device)
+  type: chrome
+  # Chrome-specific settings
+  chrome_bin: /usr/bin/google-chrome-canary
+  profile_dir: ~/media/chrome-nano-canary-profile
+  # ADB-specific settings (only needed if type: adb)
+  # serial: 48181FDAP00A1U
+
+# Metric configuration
+metric:
+  # Path to the Python file containing domain-specific metric functions.
+  # Must define: parse_output(text) -> Any, score_detailed(prediction, ground_truth) -> dict
+  module: /path/to/your/metric.py
+
+# Prompt configuration
+prompts:
+  # Directory containing versioned prompt JSON files
+  dir: /path/to/your/prompts
+  # Key in prompt JSON that contains the prompt text
+  prompt_key: food_prompt
+
+# Strategy tracking (relative to this config file's directory)
+strategy_dir: strategy

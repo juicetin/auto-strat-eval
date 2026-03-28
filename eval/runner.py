@@ -1,98 +1,190 @@
 #!/usr/bin/env python3
 """
-Evaluation runner — run prompts against labeled dataset and return scores.
+Evaluation runner — run prompts against a labeled dataset and return scores.
 
 This is the mechanical core of auto-strat-eval. Both execution modes
 (Claude Code session and API driver) call this for evaluation.
 
+All configuration comes from a project.yaml file — no domain-specific
+logic lives here.
+
 Usage:
     # Single prompt evaluation
-    python runner.py --prompt prompts/v5-few-shot.json --backend chrome
+    python -m eval.runner --config /path/to/project.yaml --prompt prompts/v5.json
 
     # Compare multiple prompts
-    python runner.py --prompt prompts/v5.json prompts/v6.json --backend chrome
+    python -m eval.runner --config project.yaml --prompt v5.json v6.json
 
     # Regression check (best prompt against all historical metrics)
-    python runner.py --prompt prompts/v7.json --regression --backend chrome
-
-    # Use adb backend instead
-    python runner.py --prompt prompts/v5.json --backend adb --serial 48181FDAP00A1U
+    python -m eval.runner --config project.yaml --prompt v7.json --regression
 """
 
 import argparse
 import base64
+import importlib.util
 import json
 import sys
 import time
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).parent.parent
-DATASET_DIR = REPO_ROOT / "dataset"
-PROMPTS_DIR = REPO_ROOT / "eval" / "prompts"
-METRICS_DIR = REPO_ROOT / "strategy" / "metrics"
+import yaml
 
 
-def load_dataset() -> list[dict]:
-    """Load labeled examples from dataset/labels/."""
-    labels_dir = DATASET_DIR / "labels"
+# ---------------------------------------------------------------------------
+# Config loading
+# ---------------------------------------------------------------------------
+
+def load_config(config_path: str) -> dict:
+    """Load project.yaml and resolve relative paths."""
+    config_path = Path(config_path).resolve()
+    config_dir = config_path.parent
+
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f)
+
+    def resolve(p):
+        p = Path(p).expanduser()
+        return p if p.is_absolute() else (config_dir / p).resolve()
+
+    cfg["_config_dir"] = config_dir
+    cfg["dataset"]["labels_dir"] = resolve(cfg["dataset"]["labels_dir"])
+    cfg["dataset"]["image_root"] = resolve(cfg["dataset"]["image_root"])
+    cfg["metric"]["module"] = resolve(cfg["metric"]["module"])
+    cfg["prompts"]["dir"] = resolve(cfg["prompts"]["dir"])
+    cfg["strategy_dir"] = resolve(cfg.get("strategy_dir", "strategy"))
+    if "goal" in cfg:
+        cfg["goal"] = resolve(cfg["goal"])
+
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# Dataset loading
+# ---------------------------------------------------------------------------
+
+def load_dataset(cfg: dict) -> list[dict]:
+    """Load labeled examples using config paths."""
+    labels_dir = Path(cfg["dataset"]["labels_dir"])
+    image_root = Path(cfg["dataset"]["image_root"])
+    image_key = cfg["dataset"].get("image_key", "image")
+    gt_key = cfg["dataset"].get("ground_truth_key", "ground_truth")
+
     examples = []
     for lf in sorted(labels_dir.glob("*.json")):
+        if lf.name.startswith("EXAMPLE"):
+            continue
         data = json.loads(lf.read_text())
-        img = DATASET_DIR / "images" / data["image"]
-        if not img.exists():
-            print(f"  SKIP: {lf.name} — image not found: {img}")
+        img_name = data.get(image_key, "")
+        # Strip any relative path prefix — just use the filename against image_root
+        img_path = image_root / Path(img_name).name
+        if not img_path.exists():
+            # Try the raw path as-is (might be relative to labels_dir)
+            img_path = labels_dir / img_name
+        if not img_path.exists():
+            print(f"  SKIP: {lf.name} — image not found: {img_name}")
             continue
         examples.append({
             "label_file": lf.name,
-            "image": str(img),
-            "dishes": data["dishes"],
+            "image": str(img_path),
+            "ground_truth": data.get(gt_key, data),
         })
     return examples
 
 
-def load_prompt(path: str | Path) -> dict:
+# ---------------------------------------------------------------------------
+# Prompt loading
+# ---------------------------------------------------------------------------
+
+def load_prompt(path: str, cfg: dict) -> dict:
     """Load a versioned prompt JSON file."""
     path = Path(path)
     if not path.is_absolute():
-        path = PROMPTS_DIR / path
+        path = Path(cfg["prompts"]["dir"]) / path
     data = json.loads(path.read_text())
+    prompt_key = cfg["prompts"].get("prompt_key", "prompt")
     return {
-        "name": f"{data['version']}-{data['name']}",
-        "prompt": data["food_prompt"],
+        "name": f"{data.get('version', '?')}-{data.get('name', path.stem)}",
+        "prompt": data[prompt_key],
         "version_file": path.name,
+        "path": str(path),
         "metadata": data,
     }
 
 
-def create_backend(backend: str, **kwargs):
-    """Create an LM backend for the model being evaluated."""
-    if backend == "chrome":
-        from backends.chrome import GeminiNanoChromeLM
-        lm = GeminiNanoChromeLM()
+# ---------------------------------------------------------------------------
+# Metric loading
+# ---------------------------------------------------------------------------
+
+def load_metric_module(module_path: str | Path):
+    """Dynamically load a metric module. Must define score_detailed()."""
+    module_path = Path(module_path).resolve()
+    spec = importlib.util.spec_from_file_location("domain_metric", str(module_path))
+    mod = importlib.util.module_from_spec(spec)
+
+    # Ensure the module's directory is in sys.path for its own imports
+    mod_dir = str(module_path.parent)
+    if mod_dir not in sys.path:
+        sys.path.insert(0, mod_dir)
+
+    spec.loader.exec_module(mod)
+
+    if not hasattr(mod, "score_detailed"):
+        raise AttributeError(f"Metric module {module_path} must define score_detailed()")
+
+    return mod
+
+
+# ---------------------------------------------------------------------------
+# Backend creation
+# ---------------------------------------------------------------------------
+
+def create_backend(cfg: dict):
+    """Create an LM backend from config."""
+    backend_cfg = cfg["backend"]
+    backend_type = backend_cfg["type"]
+
+    # Add backends directory to path
+    backends_dir = str(Path(__file__).parent / "backends")
+    if backends_dir not in sys.path:
+        sys.path.insert(0, backends_dir)
+
+    if backend_type == "chrome":
+        from chrome import GeminiNanoChromeLM
+        kwargs = {}
+        if "chrome_bin" in backend_cfg:
+            kwargs["chrome_bin"] = backend_cfg["chrome_bin"]
+        if "profile_dir" in backend_cfg:
+            kwargs["profile_dir"] = str(Path(backend_cfg["profile_dir"]).expanduser())
+        lm = GeminiNanoChromeLM(**kwargs)
         if not lm.ensure_model_ready():
             print("Chrome Gemini Nano model not ready")
             sys.exit(1)
         return lm
-    elif backend == "adb":
-        from backends.adb import GeminiNanoLM
+    elif backend_type == "adb":
+        from adb import GeminiNanoLM
         return GeminiNanoLM(
-            serial=kwargs.get("serial", "48181FDAP00A1U"),
-            cooldown=5.0,
-            retry_backoff=60.0,
-            max_retries=2,
+            serial=backend_cfg.get("serial", "48181FDAP00A1U"),
+            cooldown=backend_cfg.get("cooldown", 5.0),
+            retry_backoff=backend_cfg.get("retry_backoff", 60.0),
+            max_retries=backend_cfg.get("max_retries", 2),
         )
     else:
-        raise ValueError(f"Unknown backend: {backend}")
+        raise ValueError(f"Unknown backend type: {backend_type}")
 
 
-def run_prompt(lm, prompt: dict, examples: list[dict], metric_fn) -> dict:
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+
+def run_prompt(lm, prompt: dict, examples: list[dict], score_fn) -> dict:
     """Run a single prompt against all examples and return scored results."""
     results = []
 
     for ex in examples:
-        img_bytes = Path(ex["image"]).read_bytes()
+        img_path = Path(ex["image"])
+        img_bytes = img_path.read_bytes()
         b64 = base64.b64encode(img_bytes).decode()
-        ext = Path(ex["image"]).suffix
+        ext = img_path.suffix.lower()
         mime = "image/jpeg" if ext in (".jpg", ".jpeg") else "image/png"
 
         messages = [
@@ -111,111 +203,120 @@ def run_prompt(lm, prompt: dict, examples: list[dict], metric_fn) -> dict:
         except Exception as e:
             raw = f"ERROR:{e}"
 
-        detail = metric_fn(raw, ex["dishes"])
+        detail = score_fn(raw, ex["ground_truth"])
         detail["label_file"] = ex["label_file"]
         results.append(detail)
 
+    # Aggregate — collect all numeric keys from the first result
     n = len(results)
-    avg = lambda k: sum(r[k] for r in results) / n if n else 0
-
-    return {
+    aggregated = {
         "name": prompt["name"],
         "version_file": prompt["version_file"],
-        "composite": round(avg("composite"), 3),
-        "dish_name_f1": round(avg("dish_name_f1"), 3),
-        "ingredient_recall": round(avg("ingredient_recall"), 3),
-        "ingredient_precision": round(avg("ingredient_precision"), 3),
-        "weight_mae_score": round(avg("weight_mae_score"), 3),
-        "json_parse_rate": round(sum(1 for r in results if r["json_parsed"]) / max(n, 1), 3),
         "count": n,
-        "per_example": results,
     }
 
+    if n > 0:
+        numeric_keys = [k for k, v in results[0].items()
+                        if isinstance(v, (int, float)) and k != "label_file"]
+        for k in numeric_keys:
+            aggregated[k] = round(sum(r.get(k, 0) for r in results) / n, 3)
 
-def load_metric(metric_path: str | None = None):
-    """Load a metric function. Defaults to eval/metric.py:score_detailed."""
-    if metric_path:
-        # Load versioned metric from strategy/metrics/
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("metric", metric_path)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        return mod.score_detailed
-    else:
-        from metric import score_detailed
-        return score_detailed
+        # Parse rate as a special aggregate
+        if "json_parsed" in results[0]:
+            aggregated["json_parse_rate"] = round(
+                sum(1 for r in results if r.get("json_parsed")) / n, 3
+            )
+
+    aggregated["per_example"] = results
+    return aggregated
 
 
 def print_results(results: list[dict]):
-    """Print a summary table."""
-    print(f"\n{'='*80}")
-    print(f"{'Prompt':<30} {'Comp':>6} {'Name':>6} {'Recall':>7} {'Prec':>6} {'Weight':>7} {'Parse':>6}")
-    print(f"{'='*80}")
+    """Print a summary table. Adapts columns to available metrics."""
+    if not results:
+        return
 
-    for r in sorted(results, key=lambda x: -x["composite"]):
-        print(
-            f"{r['name']:<30} "
-            f"{r['composite']:>6.3f} "
-            f"{r['dish_name_f1']:>6.3f} "
-            f"{r['ingredient_recall']:>7.3f} "
-            f"{r['ingredient_precision']:>6.3f} "
-            f"{r['weight_mae_score']:>7.3f} "
-            f"{r['json_parse_rate']:>6.1%}"
-        )
+    # Determine which metric columns exist
+    skip_keys = {"name", "version_file", "count", "per_example", "json_parse_rate",
+                 "json_parsed", "latency_per_image", "metric_version"}
+    first = results[0]
+    metric_cols = [k for k in first if k not in skip_keys
+                   and isinstance(first[k], (int, float))]
 
+    # Header
+    header = f"{'Prompt':<30}"
+    for col in metric_cols:
+        label = col[:8]
+        header += f" {label:>8}"
+    if "json_parse_rate" in first:
+        header += f" {'Parse':>6}"
+    print(f"\n{'='*(len(header)+2)}")
+    print(header)
+    print(f"{'='*(len(header)+2)}")
+
+    for r in sorted(results, key=lambda x: -x.get("composite", 0)):
+        line = f"{r['name']:<30}"
+        for col in metric_cols:
+            line += f" {r.get(col, 0):>8.3f}"
+        if "json_parse_rate" in r:
+            line += f" {r['json_parse_rate']:>6.1%}"
+        print(line)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="auto-strat-eval runner")
+    parser.add_argument("--config", required=True, help="Path to project.yaml")
     parser.add_argument("--prompt", nargs="+", required=True, help="Prompt JSON file(s)")
-    parser.add_argument("--backend", choices=["chrome", "adb"], default="chrome")
-    parser.add_argument("--serial", default="48181FDAP00A1U", help="ADB device serial")
-    parser.add_argument("--metric", help="Path to metric .py file (default: eval/metric.py)")
-    parser.add_argument("--regression", action="store_true", help="Run against all historical metrics")
+    parser.add_argument("--metric", help="Override metric module path")
+    parser.add_argument("--regression", action="store_true",
+                        help="Run against all historical metrics in strategy/metrics/")
     parser.add_argument("--json-out", help="Write full results to JSON file")
     args = parser.parse_args()
 
-    examples = load_dataset()
-    if not examples:
-        print(f"No labeled examples in {DATASET_DIR}/")
-        sys.exit(1)
+    cfg = load_config(args.config)
 
+    examples = load_dataset(cfg)
+    if not examples:
+        print("No labeled examples found")
+        sys.exit(1)
     print(f"Loaded {len(examples)} labeled examples")
 
-    lm = create_backend(args.backend, serial=args.serial)
-    prompts = [load_prompt(p) for p in args.prompt]
+    lm = create_backend(cfg)
+    prompts = [load_prompt(p, cfg) for p in args.prompt]
+
+    metric_path = args.metric or cfg["metric"]["module"]
 
     if args.regression:
-        # Run the prompt(s) against all historical metrics
-        metric_files = sorted(METRICS_DIR.glob("*.py"))
+        metrics_dir = Path(cfg["strategy_dir"]) / "metrics"
+        metric_files = sorted(metrics_dir.glob("*.py"))
         if not metric_files:
-            print("No historical metrics found in strategy/metrics/")
+            print(f"No historical metrics in {metrics_dir}/")
             sys.exit(1)
 
         for prompt in prompts:
             print(f"\n=== Regression check: {prompt['name']} ===")
-            regression_results = []
             for mf in metric_files:
-                metric_fn = load_metric(str(mf))
+                mod = load_metric_module(mf)
                 start = time.time()
-                result = run_prompt(lm, prompt, examples, metric_fn)
-                result["metric_version"] = mf.stem
-                regression_results.append(result)
+                result = run_prompt(lm, prompt, examples, mod.score_detailed)
                 elapsed = time.time() - start
-                print(f"  {mf.stem}: composite={result['composite']:.3f} ({elapsed:.1f}s)")
-
+                print(f"  {mf.stem}: composite={result.get('composite', 0):.3f} ({elapsed:.1f}s)")
     else:
-        # Standard evaluation
-        metric_fn = load_metric(args.metric)
+        mod = load_metric_module(metric_path)
         all_results = []
 
         for prompt in prompts:
             print(f"\nRunning: {prompt['name']}...")
             start = time.time()
-            result = run_prompt(lm, prompt, examples, metric_fn)
+            result = run_prompt(lm, prompt, examples, mod.score_detailed)
             elapsed = time.time() - start
             result["latency_per_image"] = round(elapsed / max(result["count"], 1), 1)
             all_results.append(result)
-            print(f"  Done in {elapsed:.1f}s — composite: {result['composite']:.3f}")
+            print(f"  Done in {elapsed:.1f}s — composite: {result.get('composite', 0):.3f}")
 
         print_results(all_results)
 
