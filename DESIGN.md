@@ -338,7 +338,137 @@ Examples:
 
 ---
 
-## 9. Repository Strategy
+## 9. Execution Modes
+
+The outer loop requires an LLM for strategic reasoning. auto-strat-eval supports two modes — one for users with API access, one for users running inside an AI coding agent (Claude Code, Codex, etc.).
+
+### Mode A: Claude Code Session (No API Required)
+
+In this mode, the AI coding agent IS the outer loop LLM. No API keys, no spend. The agent follows a `program.md` skill file that instructs it how to run the optimization loop. The Python tooling handles only the mechanical parts (evaluation, scoring, logging). Strategic reasoning happens in the agent's conversation context.
+
+```
+┌─────────────────────────────────────────┐
+│  Claude Code / Codex / AI Agent         │
+│                                         │
+│  Reads: program.md, goal.md             │
+│  Reasons: outer loop strategy changes   │
+│  Calls: Python eval tooling via bash    │
+│  Writes: changelog, results, prompts    │
+└────────────┬────────────────────────────┘
+             │ bash calls
+             ▼
+┌─────────────────────────────────────────┐
+│  Python Eval Tooling                    │
+│                                         │
+│  runner.py  → run prompt vs dataset     │
+│  metric.py  → score results             │
+│  backends/  → Chrome LM, adb, etc.     │
+└─────────────────────────────────────────┘
+```
+
+How to use:
+```
+# In Claude Code, open the repo and say:
+"Read program.md and start an optimization run"
+
+# Or invoke as a skill:
+/auto-strat-eval
+```
+
+This mirrors Karpathy's autoresearch exactly — the agent in the terminal follows `program.md` instructions and runs autonomously. The difference is our `program.md` includes outer loop instructions (strategy evolution), not just inner loop (experiment execution).
+
+Advantages:
+- Zero cost (uses existing Claude Code session)
+- Full reasoning capability of frontier model
+- Agent can read/write any file, run any command
+- Natural for interactive use (human can intervene mid-run)
+
+Limitations:
+- Requires an active terminal session (Claude Code, Cursor, Codex CLI)
+- Session may hit context limits on very long runs
+- Cannot run truly unattended (agent needs a host process)
+
+### Mode B: API-Driven (Standalone Process)
+
+In this mode, a Python script makes LLM API calls for outer loop reasoning. Runs as a standalone process — no terminal agent needed. Can run overnight via cron, systemd, or nohup.
+
+```
+┌─────────────────────────────────────────┐
+│  api_driver.py                          │
+│                                         │
+│  Reads: goal.md, current strategy state │
+│  Calls: Anthropic/OpenAI API for        │
+│         strategic reasoning             │
+│  Calls: Python eval tooling directly    │
+│  Writes: changelog, results, prompts    │
+└────────────┬────────────────────────────┘
+             │ function calls
+             ▼
+┌─────────────────────────────────────────┐
+│  Python Eval Tooling                    │
+│                                         │
+│  runner.py  → run prompt vs dataset     │
+│  metric.py  → score results             │
+│  backends/  → Chrome LM, adb, etc.     │
+└─────────────────────────────────────────┘
+```
+
+How to use:
+```bash
+# Run for 8 hours overnight
+python api_driver.py --goal goal.md --hours 8
+
+# Or via nohup
+nohup python api_driver.py --goal goal.md --hours 8 > run.log 2>&1 &
+```
+
+Advantages:
+- Fully unattended (cron/systemd/nohup)
+- No context limit issues
+- Reproducible (API calls are logged)
+
+Limitations:
+- Requires API key + spend (~$5-20/night depending on outer loop calls)
+- Less flexible than agent mode (can't improvise beyond the driver code)
+
+### Shared Tooling
+
+Both modes use identical Python eval tooling, results format, and changelog structure. The only difference is where the "thinking" happens. A run started in Mode A can be continued in Mode B and vice versa — the state lives in files, not in the agent's memory.
+
+```
+auto-strat-eval/
+├── program.md              # Agent instructions (Mode A)
+├── goal.md                 # Declarative goal (both modes)
+├── DESIGN.md               # This document
+│
+├── eval/                   # Mechanical tooling (Python, both modes)
+│   ├── runner.py           # Run a prompt against dataset, return scores
+│   ├── metric.py           # Scoring (F2, reward shaping, etc.)
+│   ├── backends/           # LM backends for the model being optimized
+│   │   ├── chrome.py       # Chrome Built-in AI (Gemini Nano)
+│   │   └── adb.py          # Android adb bridge
+│   └── prompts/            # Versioned prompt files
+│
+├── strategy/               # Strategy tracking (both modes)
+│   ├── changelog.md        # Living doc — strategy evolution narrative
+│   ├── results.tsv         # Experiment results log
+│   └── metrics/            # Versioned metric definitions (Python files)
+│       ├── v1_equal.py
+│       ├── v2_f2.py
+│       └── v3_f2_reward.py
+│
+├── dataset/                # Labeled evaluation data
+│   ├── images/
+│   └── labels/
+│
+└── drivers/                # How the outer loop runs
+    ├── api_driver.py       # Mode B: standalone with API calls
+    └── program.md → ../program.md  # Mode A uses root program.md
+```
+
+---
+
+## 10. Repository Strategy
 
 ### New Repo, Not a Fork
 
