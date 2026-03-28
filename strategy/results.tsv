@@ -2,3 +2,4 @@ strategy	prompt	composite	recall	precision	weight_mae	parse_rate	latency	status	
 2026-03-28T13:01:10Z	S0	v5-few-shot.json	0.523	0.676	0.672	0.401	1.000	3.9	baseline	baseline
 2026-03-28T13:03:39Z	S0	v3-multipass.json	0.485	0.685	0.597	0.450	1.000	5.9	discard	v3-multipass
 2026-03-28T13:03:39Z	S0	v4-step-by-step.json	0.337	0.662	0.561	0.393	1.000	5.7	discard	v4-step-by-step
+2026-03-28T13:51:08Z	test	v5-few-shot.json	0.599	0.709	0.719	0.449	1.000	4.0	baseline	baseline
